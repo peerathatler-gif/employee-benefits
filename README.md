@@ -175,3 +175,5 @@ older SvelteKit/Prisma knowledge.
 - **No `svelte.config.js`.** This SvelteKit version configures the
   `sveltekit()` Vite plugin (including the adapter) directly in
   `vite.config.ts`; there's nothing to put in a separate config file.
+#   e m p l o y e e - b e n e f i t s  
+ 
