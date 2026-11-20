@@ -1,0 +1,498 @@
+// Employee Information, Benefits & Leave Management
+//
+// MySQL 8+, InnoDB, utf8mb4. Money and day-count fields use DECIMAL, never
+// FLOAT/DOUBLE. All timestamps are stored in UTC and rendered in the UI in
+// the APP_TIMEZONE (Asia/Bangkok by default).
+//
+// Phases 1-5 (bootstrap / database / identity / design system + login /
+// employee self-service: benefits, leave, announcements, notifications) are
+// wired up to application code under /app/*. AuditLog/FeatureFlag/
+// SystemEvent remain schema-only, reserved for the Admin/Developer
+// backoffice phases.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+// Connection URL lives in prisma.config.ts (Prisma 7+); PrismaClient is
+// instantiated with an explicit driver adapter (see src/lib/server/db.ts).
+datasource db {
+  provider = "mysql"
+}
+
+// ---------------------------------------------------------------------------
+// Identity & access
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  USER
+  DEVELOPER
+  ADMIN
+}
+
+/// A login identity. One row per person who can sign in.
+/// DEVELOPER is a technical-maintenance role (health/diagnostics/feature
+/// flags) — it must never implicitly gain HR data access. ADMIN is the HR/
+/// people-ops administrative role.
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique @db.VarChar(255)
+  passwordHash String    @db.VarChar(255)
+  role         UserRole  @default(USER)
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  employee                Employee?
+  sessions                Session[]
+  notifications           Notification[]
+  passwordResetTokens     PasswordResetToken[]
+  reviewedBenefitRequests BenefitRequest[]     @relation("BenefitRequestReviewedBy")
+  reviewedLeaveRequests   LeaveRequest[]       @relation("LeaveReviewedBy")
+  auditLogEntries         AuditLog[]           @relation("AuditActor")
+
+  @@index([role])
+  @@map("users")
+}
+
+/// Opaque session token. Only the hash of the token is ever stored — the
+/// raw token lives only in the user's HttpOnly cookie.
+model Session {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique @db.VarChar(255)
+  userAgent String?   @db.VarChar(512)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+/// Expiring, single-use token for the "forgot password" flow. Enumeration-
+/// safe: issuing a token never reveals whether the email exists.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique @db.VarChar(255)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Organization
+// ---------------------------------------------------------------------------
+
+model Department {
+  id        String   @id @default(cuid())
+  code      String   @unique @db.VarChar(32)
+  name      String   @db.VarChar(255)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  positions       Position[]
+  employees       Employee[]
+  benefitPolicies BenefitPolicy[]
+
+  @@map("departments")
+}
+
+model Position {
+  id           String   @id @default(cuid())
+  departmentId String
+  code         String   @db.VarChar(32)
+  title        String   @db.VarChar(255)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  employees  Employee[]
+
+  @@unique([departmentId, code])
+  @@map("positions")
+}
+
+enum EmploymentStatus {
+  ACTIVE
+  ON_LEAVE
+  SUSPENDED
+  TERMINATED
+}
+
+/// HR record for a User. 1:1 with User — not every logged-in account must
+/// have one yet (e.g. a freshly created DEVELOPER account), but any screen
+/// that reads HR data must handle the null case.
+model Employee {
+  id               String           @id @default(cuid())
+  userId           String           @unique
+  employeeCode     String           @unique @db.VarChar(32)
+  firstName        String           @db.VarChar(255)
+  lastName         String           @db.VarChar(255)
+  phone            String?          @db.VarChar(32)
+  hireDate         DateTime
+  departmentId     String
+  positionId       String
+  employmentStatus EmploymentStatus @default(ACTIVE)
+  /// Opaque cache-busting token, NOT a path or public URL — the actual
+  /// image bytes live in private storage (see `src/lib/server/storage.ts`)
+  /// and are only ever served through the authenticated `/app/avatar`
+  /// route. `null` means no avatar has been uploaded.
+  avatarUrl        String?          @db.VarChar(64)
+  avatarMimeType   String?          @db.VarChar(128)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  position   Position   @relation(fields: [positionId], references: [id], onDelete: Restrict)
+
+  employeeBenefits EmployeeBenefit[]
+  benefitRequests  BenefitRequest[]
+  leaveBalances    LeaveBalance[]
+  leaveRequests    LeaveRequest[]
+
+  @@index([departmentId])
+  @@index([positionId])
+  @@index([employmentStatus])
+  @@map("employees")
+}
+
+// ---------------------------------------------------------------------------
+// Benefits
+// ---------------------------------------------------------------------------
+
+enum BenefitPeriodType {
+  MONTHLY
+  QUARTERLY
+  YEARLY
+}
+
+model BenefitCategory {
+  id          String   @id @default(cuid())
+  code        String   @unique @db.VarChar(32)
+  name        String   @db.VarChar(255)
+  description String?  @db.Text
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  benefits Benefit[]
+
+  @@map("benefit_categories")
+}
+
+/// A catalog entry (e.g. "Annual health check-up"). `defaultLimit` is the
+/// fallback allocation amount for employees with no department-specific
+/// `BenefitPolicy`; `startDate`/`endDate` bound when the benefit can be
+/// requested at all (independent of any per-employee allocation period).
+model Benefit {
+  id           String            @id @default(cuid())
+  categoryId   String
+  name         String            @db.VarChar(255)
+  description  String?           @db.Text
+  defaultLimit Decimal           @db.Decimal(12, 2)
+  periodType   BenefitPeriodType @default(YEARLY)
+  startDate    DateTime
+  endDate      DateTime?
+  isActive     Boolean           @default(true)
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  category         BenefitCategory   @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  policies         BenefitPolicy[]
+  employeeBenefits EmployeeBenefit[]
+  requests         BenefitRequest[]
+
+  @@index([categoryId])
+  @@index([isActive])
+  @@map("benefits")
+}
+
+/// Per-department eligibility + limit override for a `Benefit`.
+/// `departmentId = null` means "applies to every department" — department-
+/// specific rows take precedence over `Benefit.defaultLimit`.
+model BenefitPolicy {
+  id             String    @id @default(cuid())
+  benefitId      String
+  departmentId   String?
+  limitAmount    Decimal   @db.Decimal(12, 2)
+  effectiveStart DateTime
+  effectiveEnd   DateTime?
+  isActive       Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  benefit          Benefit           @relation(fields: [benefitId], references: [id], onDelete: Cascade)
+  department       Department?       @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  employeeBenefits EmployeeBenefit[]
+
+  @@index([benefitId])
+  @@index([departmentId])
+  @@map("benefit_policies")
+}
+
+/// An employee's allocation of a given benefit for a specific period
+/// (e.g. the calendar year). `allocatedAmount` comes from the applicable
+/// `BenefitPolicy` (or `Benefit.defaultLimit` when none applies) at the
+/// moment the period is first touched; `usedAmount` only moves once an
+/// approval workflow exists (a later phase).
+model EmployeeBenefit {
+  id              String   @id @default(cuid())
+  employeeId      String
+  benefitId       String
+  policyId        String?
+  periodStart     DateTime
+  periodEnd       DateTime
+  allocatedAmount Decimal  @db.Decimal(12, 2)
+  usedAmount      Decimal  @default(0) @db.Decimal(12, 2)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  employee Employee       @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  benefit  Benefit        @relation(fields: [benefitId], references: [id], onDelete: Restrict)
+  policy   BenefitPolicy? @relation(fields: [policyId], references: [id], onDelete: SetNull)
+
+  @@unique([employeeId, benefitId, periodStart])
+  @@index([benefitId])
+  @@index([policyId])
+  @@map("employee_benefits")
+}
+
+enum BenefitRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+/// An employee's request to draw against their current-period allocation
+/// of a benefit. No approval workflow exists yet (that is a later phase) —
+/// this phase only creates/cancels requests; `usedAmount` on
+/// `EmployeeBenefit` is therefore untouched by a request, and the "remaining
+/// balance" check at submit time subtracts other still-PENDING requests so
+/// an employee cannot over-commit while waiting for review.
+model BenefitRequest {
+  id              String               @id @default(cuid())
+  employeeId      String
+  benefitId       String
+  requestedAmount Decimal              @db.Decimal(12, 2)
+  description     String?              @db.Text
+  status          BenefitRequestStatus @default(PENDING)
+  reviewedById    String?
+  reviewedAt      DateTime?
+  rejectionReason String?              @db.Text
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  employee    Employee            @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  benefit     Benefit             @relation(fields: [benefitId], references: [id], onDelete: Restrict)
+  reviewedBy  User?               @relation("BenefitRequestReviewedBy", fields: [reviewedById], references: [id], onDelete: SetNull)
+  attachments BenefitAttachment[]
+
+  @@index([employeeId])
+  @@index([benefitId])
+  @@index([status])
+  @@map("benefit_requests")
+}
+
+/// Private file metadata only — bytes live outside the webroot (see
+/// `src/lib/server/storage.ts`) and are only ever served back through an
+/// authenticated, ownership-checked route.
+model BenefitAttachment {
+  id               String   @id @default(cuid())
+  requestId        String
+  storageKey       String   @db.VarChar(255)
+  originalFilename String   @db.VarChar(255)
+  mimeType         String   @db.VarChar(128)
+  sizeBytes        Int
+  createdAt        DateTime @default(now())
+
+  request BenefitRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([requestId])
+  @@map("benefit_attachments")
+}
+
+// ---------------------------------------------------------------------------
+// Leave
+// ---------------------------------------------------------------------------
+
+model LeaveType {
+  id          String   @id @default(cuid())
+  code        String   @unique @db.VarChar(32)
+  name        String   @db.VarChar(255)
+  defaultDays Decimal  @db.Decimal(6, 2)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  balances LeaveBalance[]
+  requests LeaveRequest[]
+
+  @@map("leave_types")
+}
+
+model LeaveBalance {
+  id            String   @id @default(cuid())
+  employeeId    String
+  leaveTypeId   String
+  year          Int
+  allocatedDays Decimal  @db.Decimal(6, 2)
+  usedDays      Decimal  @default(0) @db.Decimal(6, 2)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  employee  Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveType LeaveType @relation(fields: [leaveTypeId], references: [id], onDelete: Restrict)
+
+  @@unique([employeeId, leaveTypeId, year])
+  @@map("leave_balances")
+}
+
+enum LeaveRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model LeaveRequest {
+  id              String             @id @default(cuid())
+  employeeId      String
+  leaveTypeId     String
+  startDate       DateTime
+  endDate         DateTime
+  totalDays       Decimal            @db.Decimal(6, 2)
+  reason          String?            @db.Text
+  status          LeaveRequestStatus @default(PENDING)
+  reviewedById    String?
+  reviewedAt      DateTime?
+  rejectionReason String?            @db.Text
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  employee    Employee          @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveType   LeaveType         @relation(fields: [leaveTypeId], references: [id], onDelete: Restrict)
+  reviewedBy  User?             @relation("LeaveReviewedBy", fields: [reviewedById], references: [id], onDelete: SetNull)
+  attachments LeaveAttachment[]
+
+  @@index([employeeId])
+  @@index([leaveTypeId])
+  @@index([status])
+  @@map("leave_requests")
+}
+
+model LeaveAttachment {
+  id               String   @id @default(cuid())
+  requestId        String
+  storageKey       String   @db.VarChar(255)
+  originalFilename String   @db.VarChar(255)
+  mimeType         String   @db.VarChar(128)
+  sizeBytes        Int
+  createdAt        DateTime @default(now())
+
+  request LeaveRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([requestId])
+  @@map("leave_attachments")
+}
+
+// ---------------------------------------------------------------------------
+// Announcements & notifications
+// ---------------------------------------------------------------------------
+
+model Announcement {
+  id          String    @id @default(cuid())
+  title       String    @db.VarChar(255)
+  body        String    @db.Text
+  isPublished Boolean   @default(false)
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([isPublished, publishedAt])
+  @@map("announcements")
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  title     String    @db.VarChar(255)
+  body      String    @db.Text
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Platform / developer portal (schema only — Phase 8+ wires up the UI/logic)
+// ---------------------------------------------------------------------------
+
+/// Append-only audit trail. Never log secrets (passwords, raw tokens, etc).
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorUserId  String?
+  action       String   @db.VarChar(128)
+  entityType   String   @db.VarChar(128)
+  entityId     String?  @db.VarChar(128)
+  metadataJson String?  @db.Text
+  requestId    String?  @db.VarChar(64)
+  createdAt    DateTime @default(now())
+
+  actor User? @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([actorUserId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model FeatureFlag {
+  id          String   @id @default(cuid())
+  key         String   @unique @db.VarChar(64)
+  description String?  @db.Text
+  isEnabled   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("feature_flags")
+}
+
+enum SystemEventSeverity {
+  INFO
+  WARNING
+  ERROR
+  CRITICAL
+}
+
+model SystemEvent {
+  id           String              @id @default(cuid())
+  source       String              @db.VarChar(128)
+  severity     SystemEventSeverity @default(INFO)
+  message      String              @db.Text
+  metadataJson String?             @db.Text
+  createdAt    DateTime            @default(now())
+
+  @@index([severity, createdAt])
+  @@map("system_events")
+}

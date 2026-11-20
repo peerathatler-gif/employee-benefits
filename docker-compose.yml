@@ -1,0 +1,44 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: employee-benefits-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: employee_benefits
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me_root}
+      MYSQL_USER: ${MYSQL_USER:-app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-change_me_app}
+    ports:
+      - '3306:3306'
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'mysqladmin',
+          'ping',
+          '-h',
+          'localhost',
+          '-u',
+          'root',
+          '-p${MYSQL_ROOT_PASSWORD:-change_me_root}'
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Dev-only database browser. Do not expose in production.
+  adminer:
+    image: adminer
+    container_name: employee-benefits-adminer
+    restart: unless-stopped
+    ports:
+      - '8080:8080'
+    depends_on:
+      - mysql
+    profiles:
+      - dev
+
+volumes:
+  mysql_data:
